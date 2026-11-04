@@ -1,0 +1,36 @@
+# Render Blueprint: New > Blueprint > pick this repo.
+# Frankfurt: BingX restricts the US regions, and third-party lists put Singapore on its restricted list.
+# The web service must be a paid instance: free instances sleep, and a sleeping bot misses the daily run.
+services:
+  - type: web
+    name: bingx-bot
+    runtime: node
+    region: frankfurt
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    numInstances: 1 # one instance only: two would trade the same accounts twice
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bingx-bot-db
+          property: connectionString
+      - key: BINGX_HOST
+        value: open-api-vst.bingx.com # BingX demo exchange. Change to open-api.bingx.com to trade real money.
+      - key: MAX_LEVERAGE
+        value: "10"
+      - key: MIN_EQUITY_USDT
+        value: "500"
+      - key: BOT_TOKEN
+        sync: false # set in the dashboard: openssl rand -hex 32. Same value goes in the frontend as BINGX_BOT_TOKEN.
+      - key: KEY_ENCRYPTION_SECRET
+        sync: false # set in the dashboard: openssl rand -hex 32. Losing it makes every stored key unreadable.
+
+databases:
+  - name: bingx-bot-db
+    region: frankfurt
+    plan: basic-256mb
+    databaseName: bingx_bot
