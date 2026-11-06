@@ -23,7 +23,7 @@ services:
       - key: MAX_LEVERAGE
         value: "10"
       - key: MIN_EQUITY_USDT
-        value: "500"
+        value: "100"
       - key: BOT_TOKEN
         sync: false # set in the dashboard: openssl rand -hex 32. Same value goes in the frontend as BINGX_BOT_TOKEN.
       - key: KEY_ENCRYPTION_SECRET

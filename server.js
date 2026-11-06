@@ -1,13 +1,13 @@
 const crypto = require("crypto");
 const http = require("http");
 const store = require("./store");
-const { BingXClient } = require("./bingx");
+const { BingXClient, proxied } = require("./bingx");
 const { rebalanceAccount, runDue, isRunning, closeBook, equityOf, bookPositions, ensureOneWay } = require("./rebalance");
 const { loadPortfolio, quotes } = require("./portfolio");
 
 const port = Number(process.env.PORT) || 3000;
 /** Smallest account the bot accepts, in USDT. Below it, legs fall under BingX's order minimums. */
-const MIN_EQUITY_USDT = Number(process.env.MIN_EQUITY_USDT) || 500;
+const MIN_EQUITY_USDT = Number(process.env.MIN_EQUITY_USDT) || 100;
 const hits = new Map();
 
 /** Only the Xade frontend's server calls this service, with the shared BOT_TOKEN. */
@@ -61,11 +61,20 @@ async function handle(req, res) {
   const url = new URL(req.url || "/", "http://localhost");
   const path = url.pathname;
 
-  if (path === "/health") return sendJson(res, 200, { ok: true, service: "bingx-bot", host: process.env.BINGX_HOST || "open-api.bingx.com" });
+  if (path === "/health") return sendJson(res, 200, { ok: true, service: "bingx-bot", host: process.env.BINGX_HOST || "open-api.bingx.com", proxied: proxied() });
   if (!authorized(req)) return sendJson(res, 401, { error: "Unauthorized" });
 
   if (req.method === "GET" && path === "/prices") {
     return sendJson(res, 200, await quotes((url.searchParams.get("symbols") || "").split(",")));
+  }
+
+  // Find a user's account by the owner id the connect stored, so a new device or login restores it.
+  if (req.method === "GET" && path === "/owner-account") {
+    const ownerId = (url.searchParams.get("ownerId") || "").trim();
+    if (!ownerId) return sendJson(res, 400, { error: "Missing owner" });
+    const row = await store.accountByOwner(ownerId);
+    if (!row) return sendJson(res, 404, { error: "No account for this owner" });
+    return sendJson(res, 200, { accountId: row.id });
   }
 
   const accountMatch = path.match(/^\/accounts\/([0-9a-f-]{36})$/i);

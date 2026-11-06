@@ -1,15 +1,27 @@
 const crypto = require("crypto");
 const https = require("https");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 
 /** Live by default; set BINGX_HOST=open-api-vst.bingx.com for BingX's demo (VST) exchange. */
 function host() {
   return process.env.BINGX_HOST || "open-api.bingx.com";
 }
 
+/**
+ * Route every BingX call through a fixed-IP proxy when BINGX_PROXY_URL is set
+ * (e.g. http://user:pass@1.2.3.4:8888), so all traffic leaves from one IP that
+ * users can whitelist. Without it, calls go out directly on the host's IP.
+ */
+const proxyAgent = process.env.BINGX_PROXY_URL ? new HttpsProxyAgent(process.env.BINGX_PROXY_URL) : undefined;
+
+function proxied() {
+  return Boolean(proxyAgent);
+}
+
 function requestJson(method, path, headers = {}) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname: host(), path, method, headers: { Accept: "application/json", ...headers }, timeout: 15_000 },
+      { hostname: host(), path, method, headers: { Accept: "application/json", ...headers }, timeout: 15_000, agent: proxyAgent },
       (res) => {
         let data = "";
         res.on("data", (chunk) => {
@@ -99,4 +111,4 @@ function bingxError(response) {
 const symbolOf = (coin) => `${coin}-USDT`;
 const coinOf = (symbol) => String(symbol || "").replace(/-USDT$/, "");
 
-module.exports = { BingXClient, publicGet, bingxError, signingString, symbolOf, coinOf, requestJson };
+module.exports = { BingXClient, publicGet, bingxError, signingString, symbolOf, coinOf, requestJson, proxied };

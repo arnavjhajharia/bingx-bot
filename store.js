@@ -82,6 +82,15 @@ async function getAccount(id) {
   return result.rows[0] || null;
 }
 
+/** The owner's most recent account, so a new device or login can restore it from their id alone. */
+async function accountByOwner(ownerId) {
+  const result = await getPool().query(
+    "SELECT * FROM accounts WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [ownerId]
+  );
+  return result.rows[0] || null;
+}
+
 async function secretOf(row) {
   return decrypt(row);
 }
@@ -124,4 +133,4 @@ function publicAccount(row) {
   };
 }
 
-module.exports = { migrate, saveAccount, getAccount, secretOf, listTradable, markRun, deleteAccount, publicAccount, getPool };
+module.exports = { migrate, saveAccount, getAccount, accountByOwner, secretOf, listTradable, markRun, deleteAccount, publicAccount, getPool };
