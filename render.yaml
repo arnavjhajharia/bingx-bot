@@ -19,7 +19,7 @@ services:
           name: bingx-bot-db
           property: connectionString
       - key: BINGX_HOST
-        value: open-api-vst.bingx.com # BingX demo exchange. Change to open-api.bingx.com to trade real money.
+        value: open-api.bingx.com # BingX live exchange (mainnet). Use open-api-vst.bingx.com for the demo exchange.
       - key: MAX_LEVERAGE
         value: "10"
       - key: MIN_EQUITY_USDT
