@@ -68,6 +68,21 @@ async function handle(req, res) {
     return sendJson(res, 200, await quotes((url.searchParams.get("symbols") || "").split(",")));
   }
 
+  if (req.method === "GET" && path === "/activity/summary") {
+    return sendJson(res, 200, { summary: await store.activitySummary() });
+  }
+
+  if (req.method === "GET" && path === "/activity") {
+    return sendJson(res, 200, {
+      activity: await store.listActivity({
+        book: url.searchParams.get("book") || "",
+        accountId: url.searchParams.get("accountId") || "",
+        kind: url.searchParams.get("kind") || "",
+        limit: url.searchParams.get("limit"),
+      }),
+    });
+  }
+
   // Find a user's account by the owner id the connect stored, so a new device or login restores it.
   if (req.method === "GET" && path === "/owner-account") {
     const ownerId = (url.searchParams.get("ownerId") || "").trim();
@@ -103,7 +118,16 @@ async function handle(req, res) {
     const modeProblem = await ensureOneWay(probe).catch((error) => error.message);
     if (modeProblem) return sendJson(res, 400, { error: modeProblem });
 
-    const accountId = await store.saveAccount({ ownerId, apiKey, apiSecret, equity });
+    const accountId = await store.saveAccount({ ownerId, apiKey, apiSecret, equity, book: "flywheel" });
+    await store.recordActivity({
+      book: "flywheel",
+      accountId,
+      ownerId,
+      kind: "connect",
+      equity,
+      ok: true,
+      detail: apiKey.length > 8 ? `${apiKey.slice(0, 4)}…${apiKey.slice(-4)}` : "key",
+    });
     rebalanceAccount(accountId).catch((error) => console.error(`first rebalance ${accountId.slice(0, 8)}: ${error.message}`));
     return sendJson(res, 200, { accountId, started: true });
   }
@@ -132,8 +156,12 @@ async function handle(req, res) {
     if (url.searchParams.get("close") === "true") {
       const client = new BingXClient(row.api_key, await store.secretOf(row));
       const errors = await closeBook(client, row.id, "exit");
-      if (errors.length) return sendJson(res, 502, { error: `Some positions did not close: ${errors.join("; ")}` });
+      if (errors.length) {
+        await store.recordActivity({ book: row.book || "flywheel", accountId: row.id, ownerId: row.owner_id, kind: "disconnect", ok: false, detail: errors.join("; ") });
+        return sendJson(res, 502, { error: `Some positions did not close: ${errors.join("; ")}` });
+      }
     }
+    await store.recordActivity({ book: row.book || "flywheel", accountId: row.id, ownerId: row.owner_id, kind: "disconnect", ok: true });
     await store.deleteAccount(row.id);
     return sendJson(res, 200, { disconnected: true });
   }

@@ -52,27 +52,119 @@ async function migrate() {
     )
   `);
   await getPool().query("CREATE INDEX IF NOT EXISTS accounts_owner ON accounts (owner_id)");
+  await getPool().query("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS book TEXT");
+  await getPool().query(`
+    CREATE TABLE IF NOT EXISTS activity (
+      id BIGSERIAL PRIMARY KEY,
+      at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      book TEXT,
+      account_id TEXT,
+      owner_id TEXT,
+      kind TEXT NOT NULL,
+      symbol TEXT,
+      side TEXT,
+      quantity DOUBLE PRECISION,
+      price DOUBLE PRECISION,
+      notional_usd DOUBLE PRECISION,
+      equity DOUBLE PRECISION,
+      ok BOOLEAN,
+      detail TEXT
+    )
+  `);
+  await getPool().query("CREATE INDEX IF NOT EXISTS activity_book_at ON activity (book, at DESC)");
+  await getPool().query("CREATE INDEX IF NOT EXISTS activity_account_at ON activity (account_id, at DESC)");
+}
+
+function num(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** One row per connect, rebalance, order, skip, halt, or failure. Secrets are never written. */
+async function recordActivity(event) {
+  try {
+    await getPool().query(
+      `INSERT INTO activity (book, account_id, owner_id, kind, symbol, side, quantity, price, notional_usd, equity, ok, detail)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [
+        event.book || null,
+        event.accountId || null,
+        event.ownerId || null,
+        String(event.kind || "event").slice(0, 40),
+        event.symbol || null,
+        event.side || null,
+        num(event.quantity),
+        num(event.price),
+        num(event.notionalUsd),
+        num(event.equity),
+        typeof event.ok === "boolean" ? event.ok : null,
+        event.detail ? String(event.detail).slice(0, 2000) : null,
+      ]
+    );
+  } catch (error) {
+    console.error("activity", error.message);
+  }
+}
+
+async function listActivity({ book, accountId, kind, limit } = {}) {
+  const where = [];
+  const params = [];
+  if (book) {
+    params.push(book);
+    where.push(`book = $${params.length}`);
+  }
+  if (accountId) {
+    params.push(accountId);
+    where.push(`account_id = $${params.length}`);
+  }
+  if (kind) {
+    params.push(kind);
+    where.push(`kind = $${params.length}`);
+  }
+  params.push(Math.min(Math.max(Number(limit) || 100, 1), 1000));
+  const result = await getPool().query(
+    `SELECT id, at, book, account_id, owner_id, kind, symbol, side, quantity, price, notional_usd, equity, ok, detail
+     FROM activity ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+     ORDER BY at DESC
+     LIMIT $${params.length}`,
+    params
+  );
+  return result.rows;
+}
+
+async function activitySummary() {
+  const result = await getPool().query(`
+    SELECT COALESCE(book, 'untagged') AS book,
+           kind,
+           count(*)::int AS events,
+           count(DISTINCT account_id)::int AS accounts,
+           coalesce(sum(notional_usd) FILTER (WHERE ok IS TRUE AND kind = 'order'), 0)::float8 AS filled_notional_usd
+    FROM activity
+    GROUP BY 1, 2
+    ORDER BY 1, 2
+  `);
+  return result.rows;
 }
 
 /** One BingX key per account; reconnecting the same key updates it and clears a pause, not a halt. */
-async function saveAccount({ ownerId, apiKey, apiSecret, equity }) {
+async function saveAccount({ ownerId, apiKey, apiSecret, equity, book = "flywheel" }) {
   const sealed = encrypt(apiSecret);
   const existing = await getPool().query("SELECT id FROM accounts WHERE api_key = $1", [apiKey]);
   if (existing.rows[0]) {
     const id = existing.rows[0].id;
     await getPool().query(
       `UPDATE accounts SET owner_id = $2, secret_ciphertext = $3, secret_iv = $4, secret_tag = $5,
-              paused_reason = NULL, last_error = NULL
+              paused_reason = NULL, last_error = NULL, book = COALESCE($6, book)
         WHERE id = $1`,
-      [id, ownerId, sealed.ciphertext, sealed.iv, sealed.tag]
+      [id, ownerId, sealed.ciphertext, sealed.iv, sealed.tag, book]
     );
     return id;
   }
   const id = crypto.randomUUID();
   await getPool().query(
-    `INSERT INTO accounts (id, owner_id, api_key, secret_ciphertext, secret_iv, secret_tag, started_equity, peak_equity)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`,
-    [id, ownerId, apiKey, sealed.ciphertext, sealed.iv, sealed.tag, equity]
+    `INSERT INTO accounts (id, owner_id, api_key, secret_ciphertext, secret_iv, secret_tag, started_equity, peak_equity, book)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)`,
+    [id, ownerId, apiKey, sealed.ciphertext, sealed.iv, sealed.tag, equity, book]
   );
   return id;
 }
@@ -130,7 +222,23 @@ function publicAccount(row) {
     lastRunAt: row.last_run_at,
     lastError: row.last_error,
     createdAt: row.created_at,
+    book: row.book || "flywheel",
+    ownerId: row.owner_id || null,
   };
 }
 
-module.exports = { migrate, saveAccount, getAccount, accountByOwner, secretOf, listTradable, markRun, deleteAccount, publicAccount, getPool };
+module.exports = {
+  migrate,
+  saveAccount,
+  getAccount,
+  accountByOwner,
+  secretOf,
+  listTradable,
+  markRun,
+  deleteAccount,
+  publicAccount,
+  getPool,
+  recordActivity,
+  listActivity,
+  activitySummary,
+};

@@ -15,6 +15,15 @@ const attempts = new Map();
 const utcDay = (date = new Date()) => date.toISOString().slice(0, 10);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function track(row, fields) {
+  return store.recordActivity({
+    book: row?.book || "flywheel",
+    accountId: row?.id || fields.accountId || null,
+    ownerId: row?.owner_id || null,
+    ...fields,
+  });
+}
+
 /** Key problems pause the account instead of retrying: the user has to fix them on BingX. */
 function isKeyProblem(message) {
   return /signature|api ?key|apikey|permission|whitelist|ip |not allowed|unauthori|forbidden|invalid key/i.test(message || "");
@@ -148,10 +157,19 @@ async function closeBook(client, accountId, label) {
   const { orders } = planOrders({ weights: zero, equity: 1, prices, positions, contracts: info, band: 0 });
   const errors = [];
   for (const [index, order] of orders.entries()) {
+    const fields = {
+      kind: "order",
+      symbol: symbolOf(order.coin),
+      side: order.side,
+      quantity: order.quantity,
+      detail: label,
+    };
     try {
       await place(client, order, orderId(accountId, `${label}${Date.now() % 100000}`, order.coin, index));
+      await track({ id: accountId, book: "flywheel" }, { ...fields, ok: true });
     } catch (error) {
       errors.push(error.message);
+      await track({ id: accountId, book: "flywheel" }, { ...fields, ok: false, detail: error.message });
     }
     await sleep(120);
   }
@@ -168,13 +186,20 @@ function fitToLeverage(weights, cap) {
 }
 
 async function rebalanceAccount(id) {
-  if (running.has(id)) return { skipped: true };
+  if (running.has(id)) {
+    await store.recordActivity({ accountId: id, book: "flywheel", kind: "skip", ok: false, detail: "already running" });
+    return { skipped: true };
+  }
   running.add(id);
   const today = utcDay();
   let row = null;
   try {
     row = await store.getAccount(id);
-    if (!row || row.halted || row.paused_reason) return { skipped: true };
+    if (!row || row.halted || row.paused_reason) {
+      await track(row || { id }, { kind: "skip", ok: false, detail: row?.halted ? "halted" : row?.paused_reason || "missing" });
+      return { skipped: true };
+    }
+    await track(row, { kind: "rebalance", ok: true, detail: "started" });
     const client = new BingXClient(row.api_key, await store.secretOf(row));
 
     const equity = await equityOf(client);
@@ -188,12 +213,14 @@ async function rebalanceAccount(id) {
         halted: true,
         lastError: errors.length ? `Stopped at the 75% drawdown; some closes failed: ${errors.join("; ")}` : "Stopped at the 75% drawdown.",
       });
+      await track(row, { kind: "halt", equity, ok: errors.length === 0, detail: errors.length ? errors.join("; ") : "75% drawdown" });
       return { halted: true, equity };
     }
 
     const modeProblem = await ensureOneWay(client);
     if (modeProblem) {
       await store.markRun(id, { peakEquity: peak, lastRebalanceDay: row.last_rebalance_day, halted: false, lastError: modeProblem, pausedReason: modeProblem });
+      await track(row, { kind: "error", equity, ok: false, detail: modeProblem });
       return { paused: modeProblem };
     }
 
@@ -210,19 +237,35 @@ async function rebalanceAccount(id) {
     const errors = [];
     const leverage = leverageFor(grossOf(weights), MAX_LEVERAGE);
     const prepared = new Set();
+    for (const skip of skipped) {
+      await track(row, { kind: "skip", symbol: symbolOf(skip.coin), equity, ok: false, detail: skip.reason });
+    }
     for (const [index, order] of orders.entries()) {
+      const price = prices[order.coin];
+      const fields = {
+        kind: "order",
+        symbol: symbolOf(order.coin),
+        side: order.side,
+        quantity: order.quantity,
+        price,
+        notionalUsd: price > 0 ? order.quantity * price : null,
+        equity,
+      };
       try {
         if (!order.reduceOnly && !prepared.has(order.coin)) {
           const problem = await prepareSymbol(client, order.coin, leverage);
           prepared.add(order.coin);
           if (problem) {
             errors.push(problem);
+            await track(row, { ...fields, ok: false, detail: problem });
             continue;
           }
         }
         await place(client, order, orderId(id, today, order.coin, index));
+        await track(row, { ...fields, ok: true, detail: order.reduceOnly ? "reduce" : "open" });
       } catch (error) {
         errors.push(error.message);
+        await track(row, { ...fields, ok: false, detail: error.message });
       }
       await sleep(120);
     }
@@ -241,6 +284,12 @@ async function rebalanceAccount(id) {
       pausedReason: keyProblem ? `BingX refused the API key: ${keyProblem}. Check the key, its permissions and its IP whitelist, then reconnect.` : null,
     });
     console.log(`rebalance ${id.slice(0, 8)} orders=${orders.length} errors=${errors.length} skipped=${skipped.length} scale=${scale.toFixed(2)}`);
+    await track(row, {
+      kind: "rebalance",
+      equity,
+      ok: errors.length === 0,
+      detail: `finished orders=${orders.length} errors=${errors.length} skipped=${skipped.length} scale=${scale.toFixed(2)}`,
+    });
     return { date: book.date, weights, equity, orders: orders.length, errors, skipped };
   } catch (error) {
     const message = error.message || String(error);
@@ -254,6 +303,7 @@ async function rebalanceAccount(id) {
       })
       .catch(() => {});
     console.error(`rebalance ${id.slice(0, 8)} failed: ${message}`);
+    await track(row || { id }, { kind: "error", ok: false, detail: message });
     return { error: message };
   } finally {
     running.delete(id);
