@@ -132,6 +132,62 @@ async function listActivity({ book, accountId, kind, limit } = {}) {
   return result.rows;
 }
 
+function numOrNull(value) {
+  if (value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Connected accounts and their recorded book, without keys or secrets. */
+async function adminOverview() {
+  const result = await getPool().query(`
+    SELECT a.id,
+           a.owner_id,
+           COALESCE(NULLIF(a.book, ''), 'flywheel') AS book,
+           a.halted,
+           a.last_run_at,
+           COALESCE(a.started_equity, (SELECT equity FROM activity WHERE account_id = a.id AND equity IS NOT NULL ORDER BY at ASC LIMIT 1)) AS start_equity,
+           COALESCE(SUM(act.notional_usd) FILTER (WHERE act.kind = 'order' AND act.ok IS TRUE), 0)::float8 AS volume,
+           (SELECT equity FROM activity WHERE account_id = a.id AND equity IS NOT NULL ORDER BY at DESC LIMIT 1) AS aum
+    FROM accounts a
+    LEFT JOIN activity act ON act.account_id = a.id
+    GROUP BY a.id
+    ORDER BY MIN(a.created_at) ASC
+  `);
+  const rows = result.rows.map((row) => {
+    const volume = Number(row.volume) || 0;
+    const startEquity = numOrNull(row.start_equity);
+    const aum = numOrNull(row.aum);
+    return {
+      id: row.id,
+      ownerId: row.owner_id || null,
+      label: String(row.id).slice(0, 8),
+      book: row.book,
+      halted: row.halted,
+      lastRunAt: row.last_run_at,
+      volume,
+      startEquity,
+      aum,
+      pnl: startEquity != null && aum != null ? aum - startEquity : null,
+      fees: 0,
+      unrealized: null,
+    };
+  });
+  const pnls = rows.map((row) => row.pnl).filter((value) => value != null);
+  const aums = rows.map((row) => row.aum).filter((value) => value != null);
+  return {
+    unit: "USDT",
+    feeBps: 0,
+    accounts: rows.length,
+    volume: rows.reduce((sum, row) => sum + row.volume, 0),
+    pnl: pnls.length ? pnls.reduce((sum, value) => sum + value, 0) : null,
+    aum: aums.length ? aums.reduce((sum, value) => sum + value, 0) : null,
+    fees: 0,
+    unrealized: null,
+    rows,
+  };
+}
+
 async function activitySummary() {
   const result = await getPool().query(`
     SELECT COALESCE(book, 'untagged') AS book,
@@ -241,4 +297,5 @@ module.exports = {
   recordActivity,
   listActivity,
   activitySummary,
+  adminOverview,
 };

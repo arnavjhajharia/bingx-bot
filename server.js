@@ -1,7 +1,7 @@
 const crypto = require("crypto");
 const http = require("http");
 const store = require("./store");
-const { BingXClient, proxied } = require("./bingx");
+const { BingXClient, bingxError, proxied } = require("./bingx");
 const { rebalanceAccount, runDue, isRunning, closeBook, equityOf, bookPositions, ensureOneWay } = require("./rebalance");
 const { loadPortfolio, quotes } = require("./portfolio");
 
@@ -57,6 +57,25 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
+async function bingxUnrealized(accountId) {
+  try {
+    const row = await store.getAccount(accountId);
+    if (!row) return null;
+    const client = new BingXClient(row.api_key, await store.secretOf(row));
+    const balance = await Promise.race([
+      client.get("/openApi/swap/v3/user/balance"),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000)),
+    ]);
+    if (bingxError(balance)) return null;
+    const rows = Array.isArray(balance.body.data) ? balance.body.data : [balance.body.data];
+    const usdt = rows.find((item) => item && item.asset === "USDT") || rows[0] || {};
+    const pnl = Number(usdt.unrealizedProfit);
+    return Number.isFinite(pnl) ? pnl : null;
+  } catch {
+    return null;
+  }
+}
+
 async function handle(req, res) {
   const url = new URL(req.url || "/", "http://localhost");
   const path = url.pathname;
@@ -66,6 +85,16 @@ async function handle(req, res) {
 
   if (req.method === "GET" && path === "/prices") {
     return sendJson(res, 200, await quotes((url.searchParams.get("symbols") || "").split(",")));
+  }
+
+  if (req.method === "GET" && path === "/admin/overview") {
+    const overview = await store.adminOverview();
+    await Promise.all(overview.rows.map(async (account) => {
+      account.unrealized = await bingxUnrealized(account.id);
+    }));
+    const marks = overview.rows.map((row) => row.unrealized).filter((value) => value != null);
+    overview.unrealized = marks.length ? marks.reduce((sum, value) => sum + value, 0) : null;
+    return sendJson(res, 200, overview);
   }
 
   if (req.method === "GET" && path === "/activity/summary") {
