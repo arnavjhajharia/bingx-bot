@@ -53,6 +53,7 @@ async function migrate() {
   `);
   await getPool().query("CREATE INDEX IF NOT EXISTS accounts_owner ON accounts (owner_id)");
   await getPool().query("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS book TEXT");
+  await getPool().query("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS owner_email TEXT");
   await getPool().query(`
     CREATE TABLE IF NOT EXISTS activity (
       id BIGSERIAL PRIMARY KEY,
@@ -143,6 +144,7 @@ async function adminOverview() {
   const result = await getPool().query(`
     SELECT a.id,
            a.owner_id,
+           a.owner_email,
            COALESCE(NULLIF(a.book, ''), 'flywheel') AS book,
            a.halted,
            a.last_run_at,
@@ -161,6 +163,7 @@ async function adminOverview() {
     return {
       id: row.id,
       ownerId: row.owner_id || null,
+      email: row.owner_email || null,
       label: String(row.id).slice(0, 8),
       book: row.book,
       halted: row.halted,
@@ -203,24 +206,25 @@ async function activitySummary() {
 }
 
 /** One BingX key per account; reconnecting the same key updates it and clears a pause, not a halt. */
-async function saveAccount({ ownerId, apiKey, apiSecret, equity, book = "flywheel" }) {
+async function saveAccount({ ownerId, ownerEmail, apiKey, apiSecret, equity, book = "flywheel" }) {
   const sealed = encrypt(apiSecret);
   const existing = await getPool().query("SELECT id FROM accounts WHERE api_key = $1", [apiKey]);
   if (existing.rows[0]) {
     const id = existing.rows[0].id;
     await getPool().query(
       `UPDATE accounts SET owner_id = $2, secret_ciphertext = $3, secret_iv = $4, secret_tag = $5,
-              paused_reason = NULL, last_error = NULL, book = COALESCE($6, book)
+              paused_reason = NULL, last_error = NULL, book = COALESCE($6, book),
+              owner_email = COALESCE($7, owner_email)
         WHERE id = $1`,
-      [id, ownerId, sealed.ciphertext, sealed.iv, sealed.tag, book]
+      [id, ownerId, sealed.ciphertext, sealed.iv, sealed.tag, book, ownerEmail || null]
     );
     return id;
   }
   const id = crypto.randomUUID();
   await getPool().query(
-    `INSERT INTO accounts (id, owner_id, api_key, secret_ciphertext, secret_iv, secret_tag, started_equity, peak_equity, book)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)`,
-    [id, ownerId, apiKey, sealed.ciphertext, sealed.iv, sealed.tag, equity, book]
+    `INSERT INTO accounts (id, owner_id, api_key, secret_ciphertext, secret_iv, secret_tag, started_equity, peak_equity, book, owner_email)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9)`,
+    [id, ownerId, apiKey, sealed.ciphertext, sealed.iv, sealed.tag, equity, book, ownerEmail || null]
   );
   return id;
 }

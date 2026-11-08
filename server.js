@@ -127,6 +127,7 @@ async function handle(req, res) {
   if (req.method === "POST" && path === "/accounts") {
     const body = await readBody(req);
     const ownerId = String(body.ownerId || "").trim();
+    const ownerEmail = String(body.ownerEmail || "").trim().toLowerCase() || null;
     const apiKey = String(body.apiKey || "").trim();
     const apiSecret = String(body.apiSecret || "").trim();
     if (!ownerId) return sendJson(res, 400, { error: "Missing the signed-in user." });
@@ -147,7 +148,7 @@ async function handle(req, res) {
     const modeProblem = await ensureOneWay(probe).catch((error) => error.message);
     if (modeProblem) return sendJson(res, 400, { error: modeProblem });
 
-    const accountId = await store.saveAccount({ ownerId, apiKey, apiSecret, equity, book: "flywheel" });
+    const accountId = await store.saveAccount({ ownerId, ownerEmail, apiKey, apiSecret, equity, book: "flywheel" });
     await store.recordActivity({
       book: "flywheel",
       accountId,
