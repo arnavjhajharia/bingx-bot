@@ -1,0 +1,30 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+    # Point the BingX client at an unresolvable host so no test can reach the real API.
+    # DATABASE_URL, BOT_TOKEN, KEY_ENCRYPTION_SECRET and BINGX_PROXY_URL are intentionally
+    # not set; tests provide their own fake values. No secrets are used by this workflow.
+    env:
+      BINGX_HOST: invalid.localhost
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
