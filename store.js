@@ -1,3 +1,4 @@
+const os = require("os");
 const crypto = require("crypto");
 const { Pool } = require("pg");
 
@@ -54,6 +55,10 @@ async function migrate() {
   await getPool().query("CREATE INDEX IF NOT EXISTS accounts_owner ON accounts (owner_id)");
   await getPool().query("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS book TEXT");
   await getPool().query("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS owner_email TEXT");
+  // Per-account run lease, so two running copies of the bot (a Render deploy overlaps old and new) never
+  // trade or close the same account at once.
+  await getPool().query("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS run_lock_until TIMESTAMPTZ");
+  await getPool().query("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS run_lock_owner TEXT");
   await getPool().query(`
     CREATE TABLE IF NOT EXISTS activity (
       id BIGSERIAL PRIMARY KEY,
@@ -287,8 +292,52 @@ function publicAccount(row) {
   };
 }
 
+/** This process. A lease is only ever extended or released by the process that took it. */
+const LOCK_OWNER = `${os.hostname()}-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+/** Long enough for a full run; the run renews it before every order, so a slow run never outlives it. */
+const RUN_LEASE_SECONDS = 600;
+
+/**
+ * Take the account's run lease if no one holds it (or it has expired). Returns the account row read in the
+ * same statement, or null when the lease is held elsewhere or the account does not exist.
+ */
+async function claimRun(id, seconds = RUN_LEASE_SECONDS) {
+  const result = await getPool().query(
+    `UPDATE accounts
+        SET run_lock_until = NOW() + make_interval(secs => $3), run_lock_owner = $2
+      WHERE id = $1 AND (run_lock_until IS NULL OR run_lock_until < NOW())
+      RETURNING *`,
+    [id, LOCK_OWNER, seconds]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Extend a lease this process still holds. False when it has expired and been taken by another copy, or the
+ * account is gone: the caller must stop trading the account.
+ */
+async function renewRun(id, seconds = RUN_LEASE_SECONDS) {
+  const result = await getPool().query(
+    `UPDATE accounts
+        SET run_lock_until = NOW() + make_interval(secs => $3)
+      WHERE id = $1 AND run_lock_owner = $2 AND run_lock_until > NOW()`,
+    [id, LOCK_OWNER, seconds]
+  );
+  return result.rowCount > 0;
+}
+
+async function releaseRun(id) {
+  await getPool().query(
+    "UPDATE accounts SET run_lock_until = NULL, run_lock_owner = NULL WHERE id = $1 AND run_lock_owner = $2",
+    [id, LOCK_OWNER]
+  );
+}
+
 module.exports = {
   migrate,
+  claimRun,
+  renewRun,
+  releaseRun,
   saveAccount,
   getAccount,
   accountByOwner,

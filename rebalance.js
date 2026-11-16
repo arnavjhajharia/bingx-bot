@@ -148,8 +148,14 @@ async function place(client, order, clientOrderId) {
   return response.body.data;
 }
 
-/** Close the book's own coins only, reduce-only. Used by the drawdown stop and on disconnect. */
-async function closeBook(client, accountId, label) {
+/** Says the order may go out: false once another copy of the bot has taken over the account. */
+const LEASE_LOST = "Lost the run lease to another copy of the bot; stopped before the remaining orders";
+
+/**
+ * Close the book's own coins only, reduce-only. Used by the drawdown stop and on disconnect.
+ * `renew` is called before every order; when it returns false the close stops.
+ */
+async function closeBook(client, accountId, label, { renew } = {}) {
   const positions = await bookPositions(client);
   const info = await contracts();
   const zero = Object.fromEntries(UNIVERSE.map((coin) => [coin, 0]));
@@ -157,6 +163,10 @@ async function closeBook(client, accountId, label) {
   const { orders } = planOrders({ weights: zero, equity: 1, prices, positions, contracts: info, band: 0 });
   const errors = [];
   for (const [index, order] of orders.entries()) {
+    if (renew && !(await renew())) {
+      errors.push(LEASE_LOST);
+      break;
+    }
     const fields = {
       kind: "order",
       symbol: symbolOf(order.coin),
@@ -185,7 +195,11 @@ function fitToLeverage(weights, cap) {
   return { weights: Object.fromEntries(Object.entries(weights).map(([coin, w]) => [coin, w * scale])), scale };
 }
 
-async function rebalanceAccount(id) {
+/**
+ * One daily run for one account. `options.due` marks a run from the 15-minute loop: it is skipped when
+ * another copy of the bot already finished the account today.
+ */
+async function rebalanceAccount(id, options = {}) {
   if (running.has(id)) {
     await store.recordActivity({ accountId: id, book: "flywheel", kind: "skip", ok: false, detail: "already running" });
     return { skipped: true };
@@ -193,12 +207,27 @@ async function rebalanceAccount(id) {
   running.add(id);
   const today = utcDay();
   let row = null;
+  let leased = false;
   try {
-    row = await store.getAccount(id);
-    if (!row || row.halted || row.paused_reason) {
-      await track(row || { id }, { kind: "skip", ok: false, detail: row?.halted ? "halted" : row?.paused_reason || "missing" });
+    // The lease comes first: without it this copy sends nothing to BingX for the account.
+    row = await store.claimRun(id);
+    if (!row) {
+      const existing = await store.getAccount(id);
+      if (!existing) {
+        await track({ id }, { kind: "skip", ok: false, detail: "missing" });
+        return { skipped: true };
+      }
+      await track(existing, { kind: "skip", ok: false, detail: "running elsewhere" });
+      return { skipped: true, locked: true };
+    }
+    leased = true;
+    // The due list was read before this lease was taken; another copy may have finished the account since.
+    if (options.due && row.last_rebalance_day === today) return { skipped: true, done: true };
+    if (row.halted || row.paused_reason) {
+      await track(row, { kind: "skip", ok: false, detail: row.halted ? "halted" : row.paused_reason });
       return { skipped: true };
     }
+    const renew = () => store.renewRun(id);
     await track(row, { kind: "rebalance", ok: true, detail: "started" });
     const client = new BingXClient(row.api_key, await store.secretOf(row));
 
@@ -206,7 +235,11 @@ async function rebalanceAccount(id) {
     const peak = row.peak_equity == null ? equity : Math.max(row.peak_equity, equity);
 
     if (shouldHalt(equity, peak)) {
-      const errors = await closeBook(client, id, "halt");
+      const errors = await closeBook(client, id, "halt", { renew });
+      if (errors.includes(LEASE_LOST)) {
+        await track(row, { kind: "halt", equity, ok: false, detail: LEASE_LOST });
+        return { skipped: true, leaseLost: true };
+      }
       await store.markRun(id, {
         peakEquity: peak,
         lastRebalanceDay: today,
@@ -241,6 +274,12 @@ async function rebalanceAccount(id) {
       await track(row, { kind: "skip", symbol: symbolOf(skip.coin), equity, ok: false, detail: skip.reason });
     }
     for (const [index, order] of orders.entries()) {
+      // A run slower than the lease must not keep trading once another copy could have taken the account.
+      if (!(await renew())) {
+        console.error(`rebalance ${id.slice(0, 8)}: ${LEASE_LOST}`);
+        await track(row, { kind: "error", equity, ok: false, detail: LEASE_LOST });
+        return { skipped: true, leaseLost: true, placed: index };
+      }
       const price = prices[order.coin];
       const fields = {
         kind: "order",
@@ -307,6 +346,44 @@ async function rebalanceAccount(id) {
     return { error: message };
   } finally {
     running.delete(id);
+    if (leased) await store.releaseRun(id).catch(() => {});
+  }
+}
+
+/**
+ * Disconnect: wait for the account's run lease (a rebalance in progress finishes its orders first), close the
+ * book's coins if asked, and delete the account while still holding the lease, so no other copy of the bot
+ * can reopen positions in between. Returns { missing }, { disconnected } or { errors } (closes that failed;
+ * the account is kept). Throws a 409 error when a rebalance is still running after `waitMs`.
+ */
+async function disconnectAccount(id, { close = false, waitMs = 25000 } = {}) {
+  const deadline = Date.now() + waitMs;
+  let row = await store.claimRun(id);
+  while (!row && Date.now() < deadline) {
+    if (!(await store.getAccount(id))) return { missing: true };
+    await sleep(1000);
+    row = await store.claimRun(id);
+  }
+  if (!row) {
+    if (!(await store.getAccount(id))) return { missing: true };
+    const busy = new Error("A rebalance is running on this account. Try again in a minute.");
+    busy.status = 409;
+    throw busy;
+  }
+  try {
+    if (close) {
+      const client = new BingXClient(row.api_key, await store.secretOf(row));
+      const errors = await closeBook(client, row.id, "exit", { renew: () => store.renewRun(id) });
+      if (errors.length) {
+        await store.releaseRun(id).catch(() => {});
+        return { errors, row };
+      }
+    }
+    await store.deleteAccount(id);
+    return { disconnected: true, row };
+  } catch (error) {
+    await store.releaseRun(id).catch(() => {});
+    throw error;
   }
 }
 
@@ -315,9 +392,9 @@ async function runDue() {
   const accounts = await store.listTradable();
   const due = accounts.filter((account) => account.last_rebalance_day !== today);
   if (due.length) console.log(`rebalance due ${due.length}`);
-  for (const account of due) await rebalanceAccount(account.id);
+  for (const account of due) await rebalanceAccount(account.id, { due: true });
 }
 
 const isRunning = (id) => running.has(id);
 
-module.exports = { rebalanceAccount, runDue, isRunning, closeBook, equityOf, bookPositions, ensureOneWay, contracts, fitToLeverage, utcDay, orderId };
+module.exports = { rebalanceAccount, disconnectAccount, runDue, isRunning, closeBook, equityOf, bookPositions, ensureOneWay, contracts, fitToLeverage, utcDay, orderId, LEASE_LOST };

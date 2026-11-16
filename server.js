@@ -2,7 +2,7 @@ const crypto = require("crypto");
 const http = require("http");
 const store = require("./store");
 const { BingXClient, bingxError, proxied } = require("./bingx");
-const { rebalanceAccount, runDue, isRunning, closeBook, equityOf, bookPositions, ensureOneWay } = require("./rebalance");
+const { rebalanceAccount, disconnectAccount, runDue, isRunning, equityOf, bookPositions, ensureOneWay } = require("./rebalance");
 const { loadPortfolio, quotes } = require("./portfolio");
 
 const port = Number(process.env.PORT) || 3000;
@@ -182,17 +182,23 @@ async function handle(req, res) {
   if (accountMatch && req.method === "DELETE") {
     const row = await store.getAccount(accountMatch[1]);
     if (!row) return sendJson(res, 404, { error: "Account not found" });
-    // Closing is a separate choice the user makes: ?close=true closes the bot's coins first.
-    if (url.searchParams.get("close") === "true") {
-      const client = new BingXClient(row.api_key, await store.secretOf(row));
-      const errors = await closeBook(client, row.id, "exit");
-      if (errors.length) {
-        await store.recordActivity({ book: row.book || "flywheel", accountId: row.id, ownerId: row.owner_id, kind: "disconnect", ok: false, detail: errors.join("; ") });
-        return sendJson(res, 502, { error: `Some positions did not close: ${errors.join("; ")}` });
-      }
+    const activity = (fields) =>
+      store.recordActivity({ book: row.book || "flywheel", accountId: row.id, ownerId: row.owner_id, kind: "disconnect", ...fields });
+    // Closing is a separate choice the user makes: ?close=true closes the bot's coins first. It waits for a
+    // rebalance in progress and holds the run lease until the account is deleted.
+    let result;
+    try {
+      result = await disconnectAccount(row.id, { close: url.searchParams.get("close") === "true" });
+    } catch (error) {
+      await activity({ ok: false, detail: error.message });
+      return sendJson(res, error.status === 409 ? 409 : 502, { error: error.message });
     }
-    await store.recordActivity({ book: row.book || "flywheel", accountId: row.id, ownerId: row.owner_id, kind: "disconnect", ok: true });
-    await store.deleteAccount(row.id);
+    if (result.missing) return sendJson(res, 404, { error: "Account not found" });
+    if (result.errors) {
+      await activity({ ok: false, detail: result.errors.join("; ") });
+      return sendJson(res, 502, { error: `Some positions did not close: ${result.errors.join("; ")}` });
+    }
+    await activity({ ok: true });
     return sendJson(res, 200, { disconnected: true });
   }
 
